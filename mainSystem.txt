@@ -1,0 +1,290 @@
+#=============================================================================
+#-----------------------------------------------------------------------------
+"""
+Drone Controller for DIJ Tello Drone for Bridge Concrete Crack Detection
+
+Tony Stone
+
+Advisor: Dr. Alaa Sheta
+
+2025
+"""
+#=============================================================================
+# Imports
+#-----------------------------------------------------------------------------
+import tensorflow as tf
+from djitellopy import tello
+from threading import Thread as th, Lock
+import time as t
+import numpy as np
+from datetime import datetime as clock
+from cv2 import FONT_HERSHEY_COMPLEX as font
+from cv2 import WINDOW_NORMAL as wn
+from cv2 import LINE_AA as line
+from cv2 import BORDER_CONSTANT as borderConstant
+from cv2 import WND_PROP_TOPMOST as topMost
+import cv2 as cv
+
+#=============================================================================
+# Housekeeping
+#-----------------------------------------------------------------------------
+# djitellopy is chatty, limit console output to only errors
+import logging
+logging.getLogger('djitellopy').setLevel(logging.CRITICAL)
+
+#=============================================================================
+# Functions
+#-----------------------------------------------------------------------------
+# Initialize UAV and return instance
+def getUAV():
+    """Create UAV instance and establish a connection"""
+    uav = tello.Tello()
+    uav.connect()
+    uav.streamon()
+    return uav
+
+#=============================================================================
+# Classes
+#-----------------------------------------------------------------------------
+# Convolutional Neural Network
+class CNN:
+    def __init__(self):
+        """Load exported TensorFlow CNN model."""
+        self.model = tf.saved_model.load("models/Dr_Sheta_CNN_UAV")
+        self.inference = self.model.signatures['serving_default']
+        self.classes = ["No Crack", "Crack"]
+        self.colors = [(0, 225, 0), (0, 0, 225)]
+
+        self.feed = None
+
+        self.running = False
+        self.passTimer = 1/30 # ~FPS
+        self.lock = Lock()
+        self.thread = th(target = self.loop, daemon= True)
+
+        self.classifiedImage = None
+
+    def classify(self, feed):
+        """Preprocess feed and perform classification."""
+        feed = cv.cvtColor(feed, cv.COLOR_BGR2RGB)
+        feed = feed.astype(np.float32)
+        feed = cv.resize(feed, (224, 224))
+        feed = np.expand_dims(feed, axis = 0)
+        inference = list(self.inference(tf.constant(feed)).values())[0].numpy()
+        classIndex = np.argmax(inference)
+        return  self.classes[classIndex], self.colors[classIndex], float(np.max(inference))
+
+    def sendFeed(self, feed):
+        """Provide the CNN with camera frame."""
+        with self.lock:
+            self.feed = feed.copy()
+
+    def passFeed(self):
+        """Segment feed into tiles"""
+        with self.lock:
+            if self.feed is None:
+                return None
+            baseImage = self.feed.copy()
+
+        image = baseImage.copy()
+        mask = np.zeros(image.shape[:2], np.uint8)
+
+        # specify ROI
+        x, y, w, h = 300, 230, 360, 260
+        mask[y:y + h, x:x + w] = 255
+        feed = baseImage[y:y+h, x:x+w]
+
+        blurred = cv.GaussianBlur(image, (25, 25), 0)
+        focused = np.where(mask[..., None] == 255, image, blurred)
+        
+        label, color, inf = self.classify(feed)
+
+        # Add marker if Crack is detected
+        if label == "Crack":
+            cv.rectangle(focused, (x, y), (w+x, h+y), color, 2)
+            cv.putText(focused, f"{label}: {inf*100:.2f}%", 
+                                org = (10 + x, 30 + y),
+                                fontFace = font,
+                                fontScale = 1,
+                                color = color,
+                                thickness = 1, 
+                                lineType = line,
+                                bottomLeftOrigin = False)
+        
+        # Specify ROI Area
+        cv.rectangle(focused, (x - 2, y - 2), (w+x + 4, h+y + 4), (0, 0, 0), 2)
+        cv.putText(focused, f"ROI", 
+                            org = (10 + x, y - 10),
+                            fontFace = font,
+                            fontScale = 1,
+                            color = (0, 0, 0),
+                            thickness = 1, 
+                            lineType = line,
+                            bottomLeftOrigin = False)
+        
+        self.classifiedImage = focused
+    
+    def getClassified(self):
+        """Return the last classified frame"""
+        with self.lock:
+            if self.classifiedImage is None:
+                return None
+            return self.classifiedImage
+
+    def loop(self):
+        """Continuous classification of video stream"""
+        while self.running:
+            with self.lock:
+                feedCopy = None if self.feed is None else self.feed.copy()
+            if feedCopy is None:
+                t.sleep(self.passTimer)
+                continue
+            self.passFeed()
+            t.sleep(self.passTimer)
+
+    def start(self):
+        """Start CNN thread."""
+        self.running = True
+        self.thread.start()
+    
+    def join(self):
+        """Join CNN thread."""
+        self.running = False
+        self.thread.join()
+
+# Joystick style controller
+class RC:
+    def __init__(self, uav, dt):
+        """Initialize RC"""
+        self.uav = uav
+        self.dt = dt
+        self.x = 0
+        self.y = 0
+        self.z = 0
+        self.yaw = 0
+        self.lastUpdate = 0
+        self.running = False
+        self.lock = Lock()
+        self.thread = th(target = self.loop, daemon = True)
+
+    def controlUAV(self, x, y, z, yaw):
+        with self.lock:
+            self.x = x
+            self.y = y
+            self.z = z
+            self.yaw = yaw
+    
+    def loop(self):
+        """ Continuous loop for rc controll"""
+        while self.running is True:
+            currentTime = t.perf_counter()
+            if currentTime - self.lastUpdate > self.dt:
+                with self.lock:
+                    self.uav.send_rc_control(int(self.x), int(self.y), int(self.z), int(self.yaw))
+                self.lastUpdate = currentTime
+            t.sleep(0.001)
+
+    def start(self):
+        """Start RC thread"""
+        self.lastUpdate = t.perf_counter()
+        self.running = True
+        self.thread.start()
+
+    def join(self):
+        """Join RC thread"""
+        self.running = False
+        self.thread.join()
+        
+#=============================================================================
+# Main
+#-----------------------------------------------------------------------------
+def main():
+
+    """Main Drone controller"""
+    try:    
+        # Load CNN model
+        cnn = CNN()
+        cnn.start()
+
+        # Establish connection, start UAV, start camera, and start control
+        uav = getUAV(); print(f"Battery: {uav.get_battery()}%")
+        active = False
+
+        # Get camera
+        camera = uav.get_frame_read()
+
+        cv.namedWindow("Classified", wn)
+        cv.resizeWindow("Classified", 720, 540)
+        CNNrecorder = None
+
+        # Initialize RC control
+        rc = RC(uav, dt = .03)
+        rc.start()
+
+        xVelocity, yVelocity, zVelocity, yawVelocity = 20, 20, 20, 15
+
+        t.sleep(1)
+        print("Begin")
+        
+        while True:
+            
+            feed = camera.frame
+            if feed is not None:
+                # Pass raw feed to CNN
+                cnn.sendFeed(feed)
+                moment = clock.now().strftime("%I:%M:%S %p")
+                
+                # Get classification
+                classified = cnn.getClassified()
+                if classified is not None:
+                    classified = cv.copyMakeBorder(classified, 40, 3, 3, 3, borderType = borderConstant, value = (255, 255, 255))
+                    cv.putText(classified, f"Time of Flight : {moment}",
+                                                    org = (10, 30),
+                                                    fontFace = font,
+                                                    fontScale = 1,
+                                                    color = (0, 0, 0),
+                                                    thickness = 1, 
+                                                    lineType = line,
+                                                    bottomLeftOrigin = False)
+                    
+                    # Update and record Classified window
+                    cv.imshow("Classified", classified)
+                    if CNNrecorder is None:
+                        h, w = classified.shape[:2]
+                        CNNrecorder = cv.VideoWriter("Capture/flight.mp4", cv.VideoWriter_fourcc(*'mp4v'), 30, (w, h))
+                    CNNrecorder.write(classified)
+
+            key = cv.waitKey(5) & 0xff
+            if key == 27: break                                             # Esc key to end
+            elif key == ord('u'):                                           # Take off
+                active = True 
+                uav.takeoff()
+            elif key == ord('j'):                                           # Land
+                active = False
+                uav.land()
+            elif key == ord('w'): rc.controlUAV(0, xVelocity, 0, 0)         # Forward
+            elif key == ord('s'): rc.controlUAV(0, -xVelocity, 0, 0)        # Backward
+            elif key == ord('a'): rc.controlUAV(-yVelocity, 0, 0, 0)        # Left
+            elif key == ord('d'): rc.controlUAV(yVelocity, 0, 0, 0)         # Right
+            elif key == ord('e'): rc.controlUAV(0, 0, 0, yawVelocity)       # Clockwise
+            elif key == ord('q'): rc.controlUAV(0, 0, 0, -yawVelocity)      # Counterclockwise
+            elif key == ord('r'): rc.controlUAV(0, 0, zVelocity, 0)         # Up
+            elif key == ord('f'): rc.controlUAV(0, 0, -zVelocity, 0)        # Down            
+            else: rc.controlUAV(0, 0, 0, 0)                                 # Stay still
+
+    finally: 
+        if active is True: 
+            rc.controlUAV(0, 0, 0, 0)
+            uav.land()
+        t.sleep(0.1)
+        rc.join()
+        uav.streamoff() 
+        uav.end()
+        cnn.join()
+        CNNrecorder.release()
+
+        cv.destroyAllWindows()
+
+#=============================================================================
+main()
+#-----------------------------------------------------------------------------
